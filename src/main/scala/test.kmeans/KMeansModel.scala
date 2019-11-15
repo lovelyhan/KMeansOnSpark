@@ -3,7 +3,7 @@ package test.kmeans
 import org.apache.spark.{SparkConf, SparkContext}
 import org.apache.spark.ml.feature.VectorAssembler
 import org.apache.spark.ml.linalg.{Vector, Vectors}
-import org.apache.spark.mllib.linalg.{SparseVector, Vector => OldVector, Vectors => OldVectors}
+import org.apache.spark.mllib.linalg.{DenseVector,SparseVector, Vector => OldVector, Vectors => OldVectors}
 import org.apache.spark.mllib.util.MLUtils
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.{DataFrame, Dataset, Row, SparkSession}
@@ -15,7 +15,7 @@ object KMeansModel {
 
 }
 
-class KMeansModel(val clusterCenters: Array[OldVector]) {
+class KMeansModel(val clusterCenters: Array[OldVector]) extends java.io.Serializable{
   @transient protected val logger: Logger = KMeansModel.logger
   private val clusterCentersWithNorm =
     if (clusterCenters == null) null else clusterCenters.map(new VectorWithNorm(_))
@@ -28,15 +28,15 @@ class KMeansModel(val clusterCenters: Array[OldVector]) {
   val randomItem = 12345
   //set epsilon
   val epsilon = 1e-4
-  //set feature's precision
+  //set feature's precision（use it in fastSquare calculation）
   val precision = 1e-6
 
   //load data
   def loadData(path: String): Dataset[_]= {
     val conf = new SparkConf()
       .setAppName("KMeans Test")
-    //      .setMaster("local")
-    //      .set("spark.executor.memory","1g")
+         // .setMaster("local")
+         // .set("spark.executor.memory","1g")
     val spark = SparkSession.builder().config(conf).getOrCreate()
 
     // Import Kmeans clustering Algorithm
@@ -47,7 +47,7 @@ class KMeansModel(val clusterCenters: Array[OldVector]) {
       .option("header","true")
       .option("inferschema","true")
       .format("csv")
-      .load("Wholesale customers data.csv")
+      .load(path)
 
     val totalLength = data.count()
     val feature_data = (data.select("Fresh", "Milk", "Grocery", "Frozen", "Detergents_Paper", "Delicassen"))
@@ -65,6 +65,7 @@ class KMeansModel(val clusterCenters: Array[OldVector]) {
       .map(_.vector).distinct.map(new VectorWithNorm(_))
   }
 
+  //transport the input csv to RDD[vector]
   def changeDataForm(data :Dataset[_]): RDD[OldVector] ={
     val instances: RDD[OldVector] = data.select("features").rdd.map {
       case Row(point: Vector) => OldVectors.fromML(point)
@@ -77,9 +78,8 @@ class KMeansModel(val clusterCenters: Array[OldVector]) {
            data: Dataset[_]
          ): KMeansModel ={
     //Change data form from dataframe[_] to rdd[vector]
-    val instances: RDD[OldVector] = data.select("features").rdd.map {
-      case Row(point: Vector) => OldVectors.fromML(point)
-    }
+    val instances = changeDataForm(data)
+    instances.cache()
     if (instances.getStorageLevel == StorageLevel.NONE){
       logger.info(s"The input data is not directly cached,which may hurt performance if its" + "parent RDDs are also uncached.")
     }
@@ -94,6 +94,7 @@ class KMeansModel(val clusterCenters: Array[OldVector]) {
     model
   }
 
+  //calculate dot value
   def dot(
            v1:OldVector,
            v2:OldVector
@@ -149,22 +150,50 @@ class KMeansModel(val clusterCenters: Array[OldVector]) {
     sqDist
   }
 
-  //???Whether the dimension could be used like this
   def axpy(figure:Double,
            x:OldVector,
            y:OldVector): Unit ={
-    var yArray = y.toArray
-    var xArray = x.toArray
-    for(i <- 0 until yArray.length){
-      yArray(i) += xArray(i)
+    y match {
+      case dy: DenseVector =>
+        x match {
+          case sx: SparseVector =>
+            logger.info("SparseVector is not supported now")
+          case dx: DenseVector =>
+            axpy(figure, dx, dy)
+          case _ =>
+            throw new UnsupportedOperationException(
+              s"axpy doesn't support x type ${x.getClass}.")
+        }
     }
-    y = OldVectors.dense(yArray)
+  }
+
+  def axpy(figure:Double,
+           x:DenseVector,
+           y:DenseVector): Unit ={
+    val xvalues = x.values
+    val yvalues = y.values
+    for(i <- 0 until yvalues.length){
+      yvalues(i) += xvalues(i)
+    }
+
   }
 
   def scal(figure:Double,
            vec:OldVector): Unit ={
-    for (i <- 0 until vec.size){
-      vec(i) = (1.0)/figure * vec(i)
+    vec match {
+      case dv:DenseVector=>
+        scal(figure,dv)
+      case _ =>
+        logger.info(s"scal doesn't support x type ${vec.getClass}.")
+    }
+  }
+
+  def scal(figure:Double,vec:DenseVector): Unit = {
+    val vecValues = vec.values
+    var k = 0
+    while (k < vecValues.length){
+      vecValues(k) *= figure
+      k += 1
     }
   }
 
@@ -195,6 +224,7 @@ class KMeansModel(val clusterCenters: Array[OldVector]) {
   def runAlgorithm(data: RDD[VectorWithNorm]): KMeansModel = {
     val sc = data.sparkContext
     val initStartTime = System.currentTimeMillis()
+    //init nodes of k size
     val centers = initRandom(data)
     val nowTime = System.currentTimeMillis()
     logger.info(s"Initialization took ${nowTime - initStartTime} ms")
@@ -215,6 +245,7 @@ class KMeansModel(val clusterCenters: Array[OldVector]) {
         val thisCenters = bcCenters.value
         val dims = thisCenters.head.vector.size
 
+        //update the total sum of centers
         val sums = Array.fill(thisCenters.length)(OldVectors.zeros(dims))
         val counts = Array.fill(thisCenters.length)(0L)
 
@@ -239,10 +270,12 @@ class KMeansModel(val clusterCenters: Array[OldVector]) {
 
       // Update the cluster centers and costs
       converged = true
+      var convergedDistance = 0.0
       newCenters.foreach { case (j, newCenter) =>
         if (converged && fastSquaredDistance(newCenter, centers(j)) > epsilon * epsilon) {
           converged = false
         }
+        convergedDistance = fastSquaredDistance(newCenter, centers(j))
         centers(j) = newCenter
       }
 
@@ -259,20 +292,26 @@ class KMeansModel(val clusterCenters: Array[OldVector]) {
       logger.info(s"KMeans converged in $iteration iterations.")
     }
 
-    logger.info(s"The cost is $cost.")
+    logger.info(s"The cost is ${cost/data.count()}.")
 
     new KMeansModel(centers.map(_.vector))
   }
 
   def computeCost(data: RDD[OldVector]): Double = {
+    val count = data.count()
     val bcCentersWithNorm = data.context.broadcast(clusterCentersWithNorm)
+    val centers = bcCentersWithNorm.value
+    for(i <- 0 until centers.length){
+      logger.info(s"The value of current center is ${centers(i).vector}")
+    }
     val cost = data
       .map(p => findClosest(bcCentersWithNorm.value, new VectorWithNorm(p))).collect()
     var total = 0.0
     for(i <- 0 until cost.length){
       total += cost.apply(i)._2
     }
-    println(s"Withing set sum of squared errors = $total")
+    val total_cost = total / count
+    println(s"Withing set sum of squared errors = $total_cost")
     bcCentersWithNorm.destroy()
     total
   }

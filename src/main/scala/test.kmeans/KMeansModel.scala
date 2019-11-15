@@ -87,7 +87,7 @@ class KMeansModel(val clusterCenters: Array[OldVector]) {
     val norms = instances.map(OldVectors.norm(_, 2.0))
     norms.persist()
     val zippedData = instances.zip(norms).map { case (v, norm) =>
-      new VectorWithNorm(v, norm)
+      new VectorWithNorm(v,norm)
     }
     val model = runAlgorithm(zippedData)
     norms.unpersist()
@@ -153,9 +153,12 @@ class KMeansModel(val clusterCenters: Array[OldVector]) {
   def axpy(figure:Double,
            x:OldVector,
            y:OldVector): Unit ={
-    for(i <- 0 until x.size){
-      y(i) += x(i)
+    var yArray = y.toArray
+    var xArray = x.toArray
+    for(i <- 0 until yArray.length){
+      yArray(i) += xArray(i)
     }
+    y = OldVectors.dense(yArray)
   }
 
   def scal(figure:Double,
@@ -279,7 +282,7 @@ class KMeansModel(val clusterCenters: Array[OldVector]) {
 
 //Used to calculate distance
 class VectorWithNorm(val vector: OldVector, val norm: Double) extends Serializable {
-  def this(vector: OldVector,norm:Double) = this(vector,norm)
+//  def this(vector: OldVector,norm:Double) = this(vector,norm)
 
   def this(vector: OldVector) = this(vector, OldVectors.norm(vector, 2.0))
 
